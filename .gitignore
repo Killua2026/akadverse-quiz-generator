@@ -1,0 +1,32 @@
+# ==========================================
+# AkadVerse Quiz Generator - .gitignore
+# ==========================================
+
+# 1. Databases (CRITICAL)
+# Never push local databases. They cause merge conflicts and leak data.
+*.db
+*.sqlite
+*.sqlite3
+akadverse_question_bank.db
+
+# 2. Python Virtual Environments
+venv/
+.venv/
+env/
+.env/
+.env
+
+# 3. Python Cache and Compiled Files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 4. OS and IDE Generated Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# 5. User specified files
+reqments.txt
