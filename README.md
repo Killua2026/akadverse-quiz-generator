@@ -1,6 +1,6 @@
 # AkadVerse: Quiz Generator
 
-**Tier 5 LLM | Microservice Port: `8005`**
+**Tier 5 LLM | Microservice Port: `8016`**
 
 An intelligent AI agent that generates highly creative, university-standard quizzes featuring real-world analogies and plausible distractors to enhance student active learning.
 
@@ -111,7 +111,7 @@ pip install -r requirements.txt
 With your virtual environment activated, run the following command:
 
 ```bash
-uvicorn quiz_generator:app --host 127.0.0.1 --port 8005 --reload
+uvicorn quiz_generator:app --host 127.0.0.1 --port 8016 --reload
 ```
 
 Expected terminal output:
@@ -119,9 +119,9 @@ Expected terminal output:
 ```
 [Startup] AkadVerse Quiz Generator initializing...
 [DB] Question bank database initialized successfully.
-[Startup] Ready. Run with: uvicorn quiz_generator:app --host 127.0.0.1 --port 8005 --reload
+[Startup] Ready. Run with: uvicorn quiz_generator:app --host 127.0.0.1 --port 8016 --reload
 INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:8005 (Press CTRL+C to quit)
+INFO:     Uvicorn running on http://127.0.0.1:8016 (Press CTRL+C to quit)
 ```
 
 ## API Endpoints
@@ -173,7 +173,7 @@ Expected terminal output:
 ## Testing with Swagger UI
 
 With the server running, open your browser to:
-[http://127.0.0.1:8005/docs](http://127.0.0.1:8005/docs)
+[http://127.0.0.1:8016/docs](http://127.0.0.1:8016/docs)
 
 ## Example Test Inputs
 
@@ -221,7 +221,7 @@ Expected: A 200 OK response containing exactly 3 questions. Verify that the expl
     Another process is holding the database connection open. The new `get_db()` context manager prevents this internally, but if you have an external SQLite viewer open, close it and try again.
 
 *   **Address already in use on startup**
-    Port 8005 is occupied by another service. Either stop the conflicting service or run the application on a different port:
+    Port 8016 is occupied by another service. Either stop the conflicting service or run the application on a different port:
     ```bash
     uvicorn quiz_generator:app --host 127.0.0.1 --port 8015 --reload
     ```

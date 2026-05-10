@@ -1,6 +1,6 @@
 """
 AkadVerse - Quiz Generator
-Tier 5 | Microservice Port: 8005
+Tier 5 | Microservice Port: 8016
 ========================================================================
 v2.0 - Robust Architecture & Creative Pedagogical Upgrades
 
@@ -140,7 +140,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     """Manages startup and shutdown events, including DB init."""
     print("[Startup] AkadVerse Quiz Generator initializing...")
     init_db()
-    print("[Startup] Ready. Run with: uvicorn quiz_generator:app --host 127.0.0.1 --port 8005 --reload")
+    print("[Startup] Ready. Run with: uvicorn quiz_generator:app --host 127.0.0.1 --port 8016 --reload")
     yield
     print("[Shutdown] AkadVerse Quiz Generator stopped.")
 
@@ -224,5 +224,5 @@ async def generate_quiz(request: QuizRequest):
         )
 
 # =========================================================
-# Run: uvicorn quiz_generator:app --host 127.0.0.1 --port 8005 --reload
+# Run: uvicorn quiz_generator:app --host 127.0.0.1 --port 8016 --reload
 # =========================================================
