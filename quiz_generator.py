@@ -14,15 +14,24 @@ What changed:
 
 import sqlite3
 import json
+import asyncio
+import logging
+import os
+import time
 from contextlib import asynccontextmanager, contextmanager
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from typing import List, Optional, AsyncIterator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from typing import Any, List, Optional, AsyncIterator
+from dotenv import load_dotenv
 
 # LangChain and Unified Google GenAI imports
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 from google import genai
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # =========================================================
 # 1. Pydantic Models for Structured Output and API Requests
@@ -44,16 +53,49 @@ class Quiz(BaseModel):
 
 class QuizRequest(BaseModel):
     """Schema for the incoming API request from the user."""
-    topic: str
-    difficulty: str
-    question_count: int = 3
-    google_api_key: str = Field(description="Your Google Gemini API key.")
+
+    model_config = ConfigDict(extra="forbid")
+
+    topic: str = Field(min_length=1, max_length=500)
+    difficulty: str = Field(min_length=1, max_length=100)
+    question_count: int = Field(default=3, ge=1, le=20)
+
+
+class ToolEnvelope(BaseModel):
+    """Common request envelope sent by the orchestrator to tools."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(min_length=1)
+    tool_name: str = Field(min_length=1)
+    params: dict[str, Any]
 
 # =========================================================
 # 2. Database Connection Management
 # =========================================================
 
 DB_PATH = "akadverse_question_bank.db"
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
+MODEL_DISCOVERY_TTL_SECONDS = int(os.getenv("MODEL_DISCOVERY_TTL_SECONDS", "300"))
+MODEL_REQUEST_TIMEOUT_SECONDS = float(os.getenv("MODEL_REQUEST_TIMEOUT_SECONDS", "45"))
+MODEL_RETRY_ATTEMPTS = int(os.getenv("MODEL_RETRY_ATTEMPTS", "2"))
+MODEL_RETRY_BACKOFF_SECONDS = float(os.getenv("MODEL_RETRY_BACKOFF_SECONDS", "1"))
+MODEL_PRIORITY = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-3.1-pro-preview",
+    "gemini-2.5-pro",
+]
+MODEL_CANDIDATES: list[str] = []
+MODEL_DISCOVERY_EXPIRES_AT = 0.0
+SELECTED_MODEL: Optional[str] = None
+LAST_ATTEMPTED_MODEL: Optional[str] = None
+LAST_SUCCESSFUL_MODEL: Optional[str] = None
+LAST_MODEL_ERROR: Optional[str] = None
+FALLBACK_COUNT = 0
 
 @contextmanager
 def get_db():
@@ -69,7 +111,7 @@ def get_db():
     except sqlite3.Error as e:
         if conn:
             conn.rollback()
-        print(f"[DB ERROR] {e}")
+        logger.exception("Database operation failed")
         raise
     finally:
         if conn:
@@ -89,47 +131,117 @@ def init_db():
                 )
             ''')
             conn.commit()
-        print("[DB] Question bank database initialized successfully.")
+        logger.info("Question bank database initialized successfully")
     except sqlite3.Error as e:
-        print(f"[DB ERROR] Database initialization failed: {e}")
+        logger.exception("Database initialization failed")
         raise
 
 # =========================================================
 # 3. Dynamic Model Discovery Logic
 # =========================================================
 
-def get_valid_model_name(api_key_str: str) -> str:
+def discover_model_candidates(api_key_str: str) -> list[str]:
     """
-    Dynamically finds a working Google Gemini model to avoid 404 errors.
-    Uses the modern unified google-genai SDK instance.
+    Discover an ordered list of available text-generation models.
     """
+    if not api_key_str:
+        return []
+
     try:
         client = genai.Client(api_key=api_key_str)
         
         all_models = [
-            m.name.replace("models/", "") 
+            m.name.replace("models/", "")
             for m in client.models.list() 
-            if m.name
+            if m.name and _is_text_model(m.name.replace("models/", ""))
         ]
         
-        priority_order = [
-            "gemini-2.5-flash", "gemini-2.0-flash", 
-            "gemini-1.5-flash", "gemini-pro"
-        ]
-        
-        for preferred in priority_order:
-            if preferred in all_models:
-                print(f"[Model] Selected AI Model dynamically: {preferred}")
-                return preferred
-                
-        if all_models:
-            print(f"[Model] Falling back to first available model: {all_models[0]}")
-            return all_models[0]
-            
+        prioritized = [model for model in MODEL_PRIORITY if model in all_models]
+        discovered_other_models = [model for model in all_models if model not in prioritized]
+        return prioritized + discovered_other_models
     except Exception as e:
-        print(f"[Model WARNING] Discovery failed ({e}). Defaulting to 'gemini-1.5-flash'.")
+        logger.warning("Model discovery failed: %s", e)
+        return []
     
-    return "gemini-1.5-flash"
+
+def _is_text_model(model_name: str) -> bool:
+    """Keep only Gemini models intended for text generation."""
+    normalized = model_name.lower()
+    blocked_tokens = ("embedding", "image", "vision", "audio", "speech", "transcribe", "tts")
+    return normalized.startswith("gemini") and not any(token in normalized for token in blocked_tokens)
+
+
+async def get_model_candidates() -> list[str]:
+    """Return cached model candidates, refreshing discovery when the cache expires."""
+    global MODEL_CANDIDATES, MODEL_DISCOVERY_EXPIRES_AT
+
+    now = time.monotonic()
+    if MODEL_CANDIDATES and MODEL_DISCOVERY_EXPIRES_AT > now:
+        return MODEL_CANDIDATES
+
+    MODEL_CANDIDATES = await asyncio.to_thread(discover_model_candidates, GOOGLE_API_KEY)
+    MODEL_DISCOVERY_EXPIRES_AT = now + MODEL_DISCOVERY_TTL_SECONDS
+    return MODEL_CANDIDATES
+
+
+def is_transient_model_error(error: Exception) -> bool:
+    """Identify provider failures that may succeed on retry or another model."""
+    message = str(error).lower()
+    transient_markers = (
+        "429", "resource_exhausted", "rate limit", "quota", "503", "unavailable",
+        "timeout", "timed out", "connection reset", "temporarily",
+    )
+    return any(marker in message for marker in transient_markers)
+
+
+async def generate_quiz_with_fallback(prompt: str, candidates: list[str]) -> Quiz:
+    """Generate a quiz with bounded retries and model fallback."""
+    global SELECTED_MODEL, LAST_ATTEMPTED_MODEL, LAST_SUCCESSFUL_MODEL
+    global LAST_MODEL_ERROR, FALLBACK_COUNT
+
+    if not candidates:
+        raise HTTPException(status_code=503, detail="No Gemini models are currently available")
+
+    last_error: Optional[Exception] = None
+    for model_index, model_name in enumerate(candidates):
+        for attempt in range(MODEL_RETRY_ATTEMPTS):
+            LAST_ATTEMPTED_MODEL = model_name
+            SELECTED_MODEL = model_name
+            logger.info("Calling Gemini model %s (attempt %s/%s)", model_name, attempt + 1, MODEL_RETRY_ATTEMPTS)
+            try:
+                llm = ChatGoogleGenerativeAI(
+                    model=model_name,
+                    api_key=GOOGLE_API_KEY,
+                    temperature=0.7,
+                    # Explicitly disable thinking to prevent the structured output hang
+                    thinking_budget=0,
+                )
+                # Use the updated json_schema method
+                structured_llm = llm.with_structured_output(Quiz, method="json_schema") 
+                result = await asyncio.wait_for(
+                    structured_llm.ainvoke(prompt),
+                    timeout=MODEL_REQUEST_TIMEOUT_SECONDS,
+                )
+                parsed_result = result if isinstance(result, Quiz) else Quiz.model_validate(result)
+                LAST_SUCCESSFUL_MODEL = model_name
+                LAST_MODEL_ERROR = None
+                return parsed_result
+            except Exception as error:
+                last_error = error
+                LAST_MODEL_ERROR = f"{type(error).__name__}: {error}"
+                if not is_transient_model_error(error):
+                    raise
+                if attempt + 1 < MODEL_RETRY_ATTEMPTS:
+                    await asyncio.sleep(MODEL_RETRY_BACKOFF_SECONDS * (2 ** attempt))
+
+        if model_index < len(candidates) - 1:
+            FALLBACK_COUNT += 1
+            logger.warning("Model %s exhausted; falling back to %s", model_name, candidates[model_index + 1])
+
+    raise HTTPException(
+        status_code=503,
+        detail="All discovered Gemini models are temporarily unavailable. Please try again later.",
+    ) from last_error
 
 # =========================================================
 # 4. FastAPI Application & Lifespan Setup
@@ -138,11 +250,18 @@ def get_valid_model_name(api_key_str: str) -> str:
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     """Manages startup and shutdown events, including DB init."""
-    print("[Startup] AkadVerse Quiz Generator initializing...")
+    logger.info("AkadVerse Quiz Generator initializing")
     init_db()
-    print("[Startup] Ready. Run with: uvicorn quiz_generator:app --host 127.0.0.1 --port 8016 --reload")
+    candidates = await get_model_candidates()
+    if candidates:
+        logger.info("Discovered %s Gemini text-generation model(s)", len(candidates))
+    elif GOOGLE_API_KEY:
+        logger.warning("Gemini model discovery returned no usable candidates")
+    else:
+        logger.warning("GOOGLE_API_KEY is not configured; model discovery skipped")
+    logger.info("Quiz Generator ready on port 8016")
     yield
-    print("[Shutdown] AkadVerse Quiz Generator stopped.")
+    logger.info("AkadVerse Quiz Generator stopped")
 
 app = FastAPI(
     title="AkadVerse Quiz Generator API",
@@ -175,35 +294,52 @@ prompt_template = PromptTemplate(
 # 5. API Endpoints
 # =========================================================
 
-@app.post("/generate-quiz", response_model=Quiz, tags=["Generation"])
-async def generate_quiz(request: QuizRequest):
-    """Endpoint to generate a new creative quiz and save it to the question bank."""
+@app.get("/health", tags=["Health"])
+def health():
+    database_status = "ok"
     try:
-        # Step 1: Run dynamic model discovery
-        selected_model = get_valid_model_name(request.google_api_key)
-        
-        # Step 2: Initialize LangChain with the selected model
-        llm = ChatGoogleGenerativeAI(
-            model=selected_model,
-            api_key=request.google_api_key,
-            temperature=0.7 # High enough for creativity, low enough for structure
-        )
-        
-        # Step 3: Enforce strict Pydantic output
-        structured_llm = llm.with_structured_output(Quiz, method="json_mode")
-        
-        # Step 4: Format the creative prompt
+        with get_db() as conn:
+            conn.execute("SELECT 1")
+    except sqlite3.Error:
+        database_status = "error"
+
+    is_ready = bool(GOOGLE_API_KEY and MODEL_CANDIDATES and database_status == "ok")
+    return {
+        "status": "ready" if is_ready else "not_ready",
+        "service": "AkadVerse Quiz Generator",
+        "llm": "google-gemini",
+        "gemini_configured": bool(GOOGLE_API_KEY),
+        "model_discovery": bool(MODEL_CANDIDATES),
+        "candidate_models": MODEL_CANDIDATES,
+        "selected_model": SELECTED_MODEL,
+        "last_attempted_model": LAST_ATTEMPTED_MODEL,
+        "last_successful_model": LAST_SUCCESSFUL_MODEL,
+        "fallback_count": FALLBACK_COUNT,
+        "last_model_error": LAST_MODEL_ERROR,
+        "database_status": database_status,
+        "database": "sqlite",
+        "database_path": DB_PATH,
+    }
+
+
+async def generate_quiz_for_request(request: QuizRequest) -> Quiz:
+    """Generate, persist, and return one validated quiz request."""
+    if not GOOGLE_API_KEY:
+        raise HTTPException(status_code=503, detail="GOOGLE_API_KEY is not configured on the server")
+
+    try:
+        # Step 1: Discover candidates and format the prompt.
+        candidates = await get_model_candidates()
         _input = prompt_template.format_prompt(
             topic=request.topic,
             difficulty=request.difficulty,
             question_count=request.question_count
         )
-        
-        # Step 5: Generate the quiz
-        print(f"[Generate] Calling Gemini API using {selected_model} for topic: {request.topic}...")
-        parsed_quiz: Quiz = structured_llm.invoke(_input.to_string()) # type: ignore
-        
-        # Step 6: Safe database insertion using the context manager
+
+        # Step 2: Generate with bounded retries and model fallback.
+        parsed_quiz = await generate_quiz_with_fallback(_input.to_string(), candidates)
+
+        # Step 3: Safe database insertion using the context manager.
         with get_db() as conn:
             conn.execute(
                 "INSERT INTO question_bank (topic, difficulty, question_data) VALUES (?, ?, ?)",
@@ -211,17 +347,44 @@ async def generate_quiz(request: QuizRequest):
             )
             conn.commit()
         
-        # Step 7: Kafka mock event
-        print(f"[KAFKA MOCK] Published event 'assessment.generated' for topic: {parsed_quiz.topic}")
+        # Step 4: Kafka/Redpanda mock event.
+        logger.info("Published assessment.generated event for topic: %s", parsed_quiz.topic)
         
         return parsed_quiz
 
-    except Exception as e:
-        print(f"[Pipeline ERROR] Quiz generation failed: {e}")
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception("Quiz generation failed")
         raise HTTPException(
-            status_code=500, 
-            detail=f"An error occurred while generating the quiz: {str(e)}"
+            status_code=500,
+            detail="An unexpected error occurred while generating the quiz.",
+        ) from error
+
+
+@app.post("/generate-quiz", response_model=Quiz, tags=["Generation"])
+async def generate_quiz(request: QuizRequest) -> Quiz:
+    """Generate a quiz from the direct service request format."""
+    return await generate_quiz_for_request(request)
+
+
+@app.post("/chat/contextual", response_model=Quiz, tags=["Generation"])
+async def contextual_quiz(envelope: ToolEnvelope) -> Quiz:
+    """Generate a quiz from the standard orchestrator tool envelope."""
+    if envelope.tool_name != "quiz_generator":
+        raise HTTPException(status_code=400, detail="Invalid tool name")
+
+    try:
+        request = QuizRequest.model_validate(envelope.params)
+    except ValidationError as error:
+        logger.warning(
+            "Invalid quiz tool parameters for session %s: %s",
+            envelope.session_id,
+            error.errors(),
         )
+        raise HTTPException(status_code=422, detail=error.errors()) from error
+
+    return await generate_quiz_for_request(request)
 
 # =========================================================
 # Run: uvicorn quiz_generator:app --host 127.0.0.1 --port 8016 --reload
